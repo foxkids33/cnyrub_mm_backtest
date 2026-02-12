@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from tqdm import tqdm
@@ -61,16 +62,17 @@ def backtest(
     """
     df = ensure_sorted_trades(trades)
 
-    dt = make_datetime_index(df["log_date"], df["TIME"])
-    prices = df["TRADE"].to_numpy(dtype=float)
-    sides = df["SIDE"].to_numpy(dtype=int)
-    vols = df["VOLUME"].to_numpy(dtype=float)
+    dt = make_datetime_index(df["log_date"], df["TIME"]).to_numpy()
+    prices = df["TRADE"].to_numpy(dtype=np.float64)
+    sides = df["SIDE"].to_numpy(dtype=np.int8)
+    vols = df["VOLUME"].to_numpy(dtype=np.float64)
 
     if tick_size is None:
         tick_size = infer_tick_size(prices)
+    tick_size = float(tick_size)
 
     strat = SimpleMarketMaker(
-        tick=float(tick_size),
+        tick=tick_size,
         base_spread_ticks=int(base_spread_ticks),
         min_spread_ticks=int(min_spread_ticks),
         max_spread_ticks=int(max_spread_ticks),
@@ -82,142 +84,178 @@ def backtest(
         mark_window=int(mark_window),
     )
 
-    cash = 0.0
-    pos = 0.0
-    last_prices: List[float] = []
+    n = len(df)
 
-    # Quote state
-    cur_bid = float("nan")
-    cur_ask = float("nan")
-    cur_mid = float("nan")
-    cur_mark = float("nan")
+    mark_buf = deque(maxlen=int(mark_window))
+    vol_buf = deque(maxlen=int(vol_window))
+
+    cur_bid = np.nan
+    cur_ask = np.nan
+    cur_mid = np.nan
+    cur_mark = np.nan
     cur_spread_ticks = int(base_spread_ticks)
 
-    records: List[Dict[str, float]] = []
+    cash = 0.0
+    pos = 0.0
 
-    n = len(df)
-    for i in tqdm(range(n), total=n, desc="backtest", smoothing=0.01):
+    # ---- preallocated outputs (fast + low memory) ----
+    pnl_arr = np.empty(n, dtype=np.float64)
+    cash_arr = np.empty(n, dtype=np.float64)
+    pos_arr = np.empty(n, dtype=np.float64)
+    mark_arr = np.empty(n, dtype=np.float64)
+    mid_arr = np.empty(n, dtype=np.float64)
+    bid_arr = np.empty(n, dtype=np.float64)
+    ask_arr = np.empty(n, dtype=np.float64)
+    spread_arr = np.empty(n, dtype=np.float32)
+    maker_fills_arr = np.empty(n, dtype=np.int8)
+    taker_fills_arr = np.empty(n, dtype=np.int8)
+    maker_fee_arr = np.empty(n, dtype=np.float64)
+    taker_fee_arr = np.empty(n, dtype=np.float64)
+
+    quote_every_n = max(1, int(quote_every_n))
+
+    def compute_mark() -> float:
+        # median of last 5 trades (window is tiny)
+        return float(np.median(np.fromiter(mark_buf, dtype=np.float64)))
+
+    def compute_spread_ticks() -> int:
+        # compute ONLY from vol_buf (size <= vol_window, constant)
+        base = int(base_spread_ticks)
+
+        if vol_mult <= 0 or len(vol_buf) < 3 or tick_size <= 0:
+            return max(int(min_spread_ticks), min(int(max_spread_ticks), base))
+
+        p = np.fromiter(vol_buf, dtype=np.float64)
+        p = p[p > 0]
+        if p.size < 3:
+            return max(int(min_spread_ticks), min(int(max_spread_ticks), base))
+
+        r = np.diff(np.log(p))
+        if r.size < 2:
+            return max(int(min_spread_ticks), min(int(max_spread_ticks), base))
+
+        sigma = float(np.std(r, ddof=1))
+        if not np.isfinite(sigma) or sigma <= 0:
+            return max(int(min_spread_ticks), min(int(max_spread_ticks), base))
+
+        extra = int(round((float(vol_mult) * p[-1] * sigma) / tick_size))
+        spread = base + extra
+        spread = max(int(min_spread_ticks), min(int(max_spread_ticks), spread))
+        return int(spread)
+
+    for i in tqdm(range(n), total=n, desc="backtest", mininterval=0.5):
         trade_price = float(prices[i])
-        last_prices.append(trade_price)
 
-        mark = strat.compute_mark(np.asarray(last_prices, dtype=float))
-        spread_ticks = strat.compute_spread_ticks(np.asarray(last_prices, dtype=float))
+        mark_buf.append(trade_price)
+        vol_buf.append(trade_price)
 
-        # Update quotes every N trades (throttle)
-        if i % max(1, int(quote_every_n)) == 0 or not np.isfinite(cur_mark):
+        mark = compute_mark()
+
+        if (i % quote_every_n == 0) or (not np.isfinite(cur_mark)):
+            spread_ticks = compute_spread_ticks()
             q = strat.compute_quotes(mark_price=mark, position=pos, spread_ticks=spread_ticks)
             cur_bid, cur_ask, cur_mid, cur_mark, cur_spread_ticks = q.bid, q.ask, q.mid, q.mark, q.spread_ticks
 
-        # Maker fills on exact touch
         n_maker_fills = 0
-        maker_notional = 0.0
         maker_fee = 0.0
 
-        def fill_qty_for_trade() -> float:
-            if fill_full_qty_on_touch:
-                return float(strat.qty)
-            return float(min(strat.qty, float(vols[i])))
+        if fill_full_qty_on_touch:
+            fq = float(strat.qty)
+        else:
+            fq = float(min(strat.qty, float(vols[i])))
 
-        # SIDE filter: only one side can fill on this trade
         if use_side_filter:
-            if sides[i] == 1:  # aggressive sell => hits bid => we buy
+            if sides[i] == 1:  # aggressive sell -> hits bid -> we buy
                 if np.isfinite(cur_bid) and trade_price == cur_bid:
-                    fq = fill_qty_for_trade()
                     notional = cur_bid * fq
                     fee = _fee(notional, fees.maker)
                     cash -= notional + fee
                     pos += fq
-                    n_maker_fills += 1
-                    maker_notional += notional
-                    maker_fee += fee
-            else:  # aggressive buy => hits ask => we sell
+                    n_maker_fills = 1
+                    maker_fee = fee
+            else:  # aggressive buy -> hits ask -> we sell
                 if np.isfinite(cur_ask) and trade_price == cur_ask:
-                    fq = fill_qty_for_trade()
                     notional = cur_ask * fq
                     fee = _fee(notional, fees.maker)
                     cash += notional
                     cash -= fee
                     pos -= fq
-                    n_maker_fills += 1
-                    maker_notional += notional
-                    maker_fee += fee
+                    n_maker_fills = 1
+                    maker_fee = fee
         else:
             if np.isfinite(cur_bid) and trade_price == cur_bid:
-                fq = fill_qty_for_trade()
                 notional = cur_bid * fq
                 fee = _fee(notional, fees.maker)
                 cash -= notional + fee
                 pos += fq
                 n_maker_fills += 1
-                maker_notional += notional
                 maker_fee += fee
-
             if np.isfinite(cur_ask) and trade_price == cur_ask:
-                fq = fill_qty_for_trade()
                 notional = cur_ask * fq
                 fee = _fee(notional, fees.maker)
                 cash += notional
                 cash -= fee
                 pos -= fq
                 n_maker_fills += 1
-                maker_notional += notional
                 maker_fee += fee
 
-        # Optional taker unwind if inventory breaks limit
+        # ---- taker unwind (optional) ----
         n_taker_fills = 0
         taker_fee = 0.0
-        taker_notional = 0.0
 
         if enable_taker_unwind and inv_limit > 0 and np.isfinite(mark):
             if pos > inv_limit:
-                # sell to reduce to unwind_to
-                target = float(unwind_to)
-                sell_qty = max(0.0, pos - target)
-                # conservative: cross with slip
-                px = mark - int(taker_slip_ticks) * float(tick_size)
-                px = float(px)
+                sell_qty = max(0.0, pos - float(unwind_to))
+                px = mark - int(taker_slip_ticks) * tick_size
                 notional = px * sell_qty
                 fee = _fee(notional, fees.taker)
                 cash += notional
                 cash -= fee
                 pos -= sell_qty
-                n_taker_fills += 1
-                taker_fee += fee
-                taker_notional += notional
+                n_taker_fills = 1
+                taker_fee = fee
             elif pos < -inv_limit:
-                target = float(unwind_to)
-                buy_qty = max(0.0, target - pos)  # since pos is negative
-                px = mark + int(taker_slip_ticks) * float(tick_size)
-                px = float(px)
+                buy_qty = max(0.0, float(unwind_to) - pos)
+                px = mark + int(taker_slip_ticks) * tick_size
                 notional = px * buy_qty
                 fee = _fee(notional, fees.taker)
                 cash -= notional + fee
                 pos += buy_qty
-                n_taker_fills += 1
-                taker_fee += fee
-                taker_notional += notional
+                n_taker_fills = 1
+                taker_fee = fee
 
         pnl = cash + pos * mark
 
-        records.append(
-            {
-                "datetime": dt.iloc[i],
-                "pnl": pnl,
-                "cash": cash,
-                "position": pos,
-                "mark_price": mark,
-                "mid": cur_mid,
-                "bid": cur_bid,
-                "ask": cur_ask,
-                "tick": float(tick_size),
-                "spread_ticks": float(cur_spread_ticks),
-                "maker_fills": float(n_maker_fills),
-                "taker_fills": float(n_taker_fills),
-                "maker_fee": float(maker_fee),
-                "taker_fee": float(taker_fee),
-                "maker_notional": float(maker_notional),
-                "taker_notional": float(taker_notional),
-            }
-        )
+        # ---- write outputs ----
+        pnl_arr[i] = pnl
+        cash_arr[i] = cash
+        pos_arr[i] = pos
+        mark_arr[i] = mark
+        mid_arr[i] = cur_mid
+        bid_arr[i] = cur_bid
+        ask_arr[i] = cur_ask
+        spread_arr[i] = float(cur_spread_ticks)
+        maker_fills_arr[i] = n_maker_fills
+        taker_fills_arr[i] = n_taker_fills
+        maker_fee_arr[i] = maker_fee
+        taker_fee_arr[i] = taker_fee
 
-    return pd.DataFrame.from_records(records)
+    out = pd.DataFrame(
+        {
+            "datetime": dt,
+            "pnl": pnl_arr,
+            "cash": cash_arr,
+            "position": pos_arr,
+            "mark_price": mark_arr,
+            "mid": mid_arr,
+            "bid": bid_arr,
+            "ask": ask_arr,
+            "tick": float(tick_size),
+            "spread_ticks": spread_arr,
+            "maker_fills": maker_fills_arr,
+            "taker_fills": taker_fills_arr,
+            "maker_fee": maker_fee_arr,
+            "taker_fee": taker_fee_arr,
+        }
+    )
+    return out
