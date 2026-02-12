@@ -43,8 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unwind_to", type=float, default=0.0, help="Target inventory after unwind (default 0).")
     p.add_argument("--taker_slip_ticks", type=int, default=1, help="Conservative slip in ticks for taker unwind.")
 
+    # Anti-toxic flow (optional)
+    p.add_argument("--flow_window", type=int, default=50, help="Window (in trades) for signed flow estimate.")
+    p.add_argument(
+        "--flow_skew_ticks",
+        type=float,
+        default=0.0,
+        help="How strongly to skew reference price in direction of flow (0 disables).",
+    )
+
     # Metrics
-    p.add_argument("--metric_freq", type=str, default="1S", help="Resample frequency for time-based Sharpe/Sortino, e.g. 1S, 10S, 1min.")
+    p.add_argument(
+        "--metric_freq",
+        type=str,
+        default="1s",
+        help="Resample frequency for time-based Sharpe/Sortino, e.g. 1s, 10s, 1min.",
+    )
     return p
 
 
@@ -71,6 +85,8 @@ def main() -> None:
         enable_taker_unwind=bool(args.enable_taker_unwind),
         unwind_to=float(args.unwind_to),
         taker_slip_ticks=int(args.taker_slip_ticks),
+        flow_window=int(args.flow_window),
+        flow_skew_ticks=float(args.flow_skew_ticks),
     )
 
     out = Path(args.out_pnl)

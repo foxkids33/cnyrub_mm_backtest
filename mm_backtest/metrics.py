@@ -18,7 +18,7 @@ def pnl_to_step_returns(pnl: pd.Series) -> np.ndarray:
     return np.diff(p)
 
 
-def pnl_to_time_returns(df: pd.DataFrame, freq: str = "1S") -> np.ndarray:
+def pnl_to_time_returns(df: pd.DataFrame, freq: str = "1s") -> np.ndarray:
     """Returns from resampled PnL over uniform time grid.
 
     Useful because per-trade returns overweight active periods.

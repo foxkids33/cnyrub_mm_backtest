@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .strategy import SimpleMarketMaker
-from .utils import ensure_sorted_trades, infer_tick_size, make_datetime_index
+from .utils import ensure_sorted_trades, infer_tick_size, make_datetime_index, price_to_tick_int
 
 
 @dataclass
@@ -43,6 +43,9 @@ def backtest(
     enable_taker_unwind: bool = True,
     unwind_to: float = 0.0,
     taker_slip_ticks: int = 1,
+    # Anti-toxic flow (optional)
+    flow_window: int = 50,
+    flow_skew_ticks: float = 0.0,
 ) -> pd.DataFrame:
     """Step-by-step tape-only backtest.
 
@@ -71,6 +74,9 @@ def backtest(
         tick_size = infer_tick_size(prices)
     tick_size = float(tick_size)
 
+    # Work in integer ticks for robust fill matching
+    price_ticks = np.rint(prices / tick_size).astype(np.int64)
+
     strat = SimpleMarketMaker(
         tick=tick_size,
         base_spread_ticks=int(base_spread_ticks),
@@ -86,14 +92,18 @@ def backtest(
 
     n = len(df)
 
-    mark_buf = deque(maxlen=int(mark_window))
+    mark_buf = deque(maxlen=int(mark_window))  # stores int ticks
     vol_buf = deque(maxlen=int(vol_window))
+    flow_buf = deque(maxlen=int(flow_window))
 
     cur_bid = np.nan
     cur_ask = np.nan
     cur_mid = np.nan
     cur_mark = np.nan
     cur_spread_ticks = int(base_spread_ticks)
+
+    cur_bid_tick: Optional[int] = None
+    cur_ask_tick: Optional[int] = None
 
     cash = 0.0
     pos = 0.0
@@ -115,8 +125,11 @@ def backtest(
     quote_every_n = max(1, int(quote_every_n))
 
     def compute_mark() -> float:
-        # median of last 5 trades (window is tiny)
-        return float(np.median(np.fromiter(mark_buf, dtype=np.float64)))
+        # Median of last `mark_window` trades, aligned to tick.
+        if len(mark_buf) == 0:
+            return float("nan")
+        med_tick = float(np.median(np.fromiter(mark_buf, dtype=np.float64)))
+        return float(med_tick * tick_size)
 
     def compute_spread_ticks() -> int:
         # compute ONLY from vol_buf (size <= vol_window, constant)
@@ -145,16 +158,7 @@ def backtest(
 
     for i in tqdm(range(n), total=n, desc="backtest", mininterval=0.5):
         trade_price = float(prices[i])
-
-        mark_buf.append(trade_price)
-        vol_buf.append(trade_price)
-
-        mark = compute_mark()
-
-        if (i % quote_every_n == 0) or (not np.isfinite(cur_mark)):
-            spread_ticks = compute_spread_ticks()
-            q = strat.compute_quotes(mark_price=mark, position=pos, spread_ticks=spread_ticks)
-            cur_bid, cur_ask, cur_mid, cur_mark, cur_spread_ticks = q.bid, q.ask, q.mid, q.mark, q.spread_ticks
+        trade_tick = int(price_ticks[i])
 
         n_maker_fills = 0
         maker_fee = 0.0
@@ -164,9 +168,13 @@ def backtest(
         else:
             fq = float(min(strat.qty, float(vols[i])))
 
+        # ------------------------------------------------------------------
+        # 1) Execute against quotes that were posted BEFORE this trade.
+        #    (No look-ahead: do not update quotes/mark from current trade first.)
+        # ------------------------------------------------------------------
         if use_side_filter:
             if sides[i] == 1:  # aggressive sell -> hits bid -> we buy
-                if np.isfinite(cur_bid) and trade_price == cur_bid:
+                if cur_bid_tick is not None and trade_tick == cur_bid_tick:
                     notional = cur_bid * fq
                     fee = _fee(notional, fees.maker)
                     cash -= notional + fee
@@ -174,7 +182,7 @@ def backtest(
                     n_maker_fills = 1
                     maker_fee = fee
             else:  # aggressive buy -> hits ask -> we sell
-                if np.isfinite(cur_ask) and trade_price == cur_ask:
+                if cur_ask_tick is not None and trade_tick == cur_ask_tick:
                     notional = cur_ask * fq
                     fee = _fee(notional, fees.maker)
                     cash += notional
@@ -183,14 +191,14 @@ def backtest(
                     n_maker_fills = 1
                     maker_fee = fee
         else:
-            if np.isfinite(cur_bid) and trade_price == cur_bid:
+            if cur_bid_tick is not None and trade_tick == cur_bid_tick:
                 notional = cur_bid * fq
                 fee = _fee(notional, fees.maker)
                 cash -= notional + fee
                 pos += fq
                 n_maker_fills += 1
                 maker_fee += fee
-            if np.isfinite(cur_ask) and trade_price == cur_ask:
+            if cur_ask_tick is not None and trade_tick == cur_ask_tick:
                 notional = cur_ask * fq
                 fee = _fee(notional, fees.maker)
                 cash += notional
@@ -198,6 +206,25 @@ def backtest(
                 pos -= fq
                 n_maker_fills += 1
                 maker_fee += fee
+
+        # ------------------------------------------------------------------
+        # 2) Update buffers with the current trade (mark/vol/flow).
+        # ------------------------------------------------------------------
+        mark_buf.append(trade_tick)
+        vol_buf.append(trade_price)
+
+        # Flow: +volume for aggressive buys (SIDE!=1), -volume for aggressive sells (SIDE==1)
+        sgn = -1.0 if sides[i] == 1 else 1.0
+        flow_buf.append(sgn * float(vols[i]))
+
+        mark = compute_mark()
+
+        flow = 0.0
+        if flow_skew_ticks != 0.0 and len(flow_buf) >= 3:
+            fb = np.fromiter(flow_buf, dtype=np.float64)
+            denom = float(np.sum(np.abs(fb)))
+            if denom > 0:
+                flow = float(np.clip(np.sum(fb) / denom, -1.0, 1.0))
 
         # ---- taker unwind (optional) ----
         n_taker_fills = 0
@@ -223,6 +250,23 @@ def backtest(
                 pos += buy_qty
                 n_taker_fills = 1
                 taker_fee = fee
+
+        # ------------------------------------------------------------------
+        # 3) (Re)quote for FUTURE trades.
+        # ------------------------------------------------------------------
+        if (i % quote_every_n == 0) or (not np.isfinite(cur_mark)):
+            spread_ticks = compute_spread_ticks()
+            q = strat.compute_quotes(
+                mark_price=mark,
+                position=pos,
+                spread_ticks=spread_ticks,
+                flow=flow,
+                flow_skew_ticks=float(flow_skew_ticks),
+            )
+            cur_bid, cur_ask, cur_mid, cur_mark, cur_spread_ticks = q.bid, q.ask, q.mid, q.mark, q.spread_ticks
+
+            cur_bid_tick = None if not np.isfinite(cur_bid) else price_to_tick_int(cur_bid, tick_size, side="nearest")
+            cur_ask_tick = None if not np.isfinite(cur_ask) else price_to_tick_int(cur_ask, tick_size, side="nearest")
 
         pnl = cash + pos * mark
 

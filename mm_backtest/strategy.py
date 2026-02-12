@@ -84,20 +84,51 @@ class SimpleMarketMaker:
         spread = max(int(self.min_spread_ticks), min(int(self.max_spread_ticks), spread))
         return int(spread)
 
-    def compute_quotes(self, mark_price: float, position: float, spread_ticks: int) -> Quotes:
+    def compute_quotes(
+        self,
+        mark_price: float,
+        position: float,
+        spread_ticks: int,
+        *,
+        flow: float = 0.0,
+        flow_skew_ticks: float = 0.0,
+    ) -> Quotes:
         if not np.isfinite(mark_price):
             mark_price = 0.0
 
-        # Inventory skew: long -> shift mid down; short -> shift mid up
-        skew = 0.0
-        if self.inv_limit > 0:
-            skew = (position / self.inv_limit) * float(self.inv_skew_ticks) * self.tick
+        # --- flow-aware reference shift (anti-toxic flow) ---
+        # flow in [-1, 1]: +1 means aggressive buys dominate (upward pressure)
+        # In that case, shift reference UP (less likely to sell), and vice versa.
+        f = float(np.clip(flow, -1.0, 1.0))
+        ref = mark_price + f * float(flow_skew_ticks) * self.tick
 
-        mid = round_to_tick(mark_price - skew, self.tick, side="nearest")
+        mid = round_to_tick(ref, self.tick, side="nearest")
 
         half_spread = int(spread_ticks) * self.tick
-        bid = round_to_tick(mid - half_spread, self.tick, side="down")
-        ask = round_to_tick(mid + half_spread, self.tick, side="up")
+
+        # --- inventory skew (asymmetric) ---
+        # Goal: when long -> discourage more buying (bid further) and encourage selling (ask closer).
+        #       when short -> discourage more selling (ask further) and encourage buying (bid closer).
+        inv_frac = 0.0
+        if self.inv_limit > 0:
+            inv_frac = float(np.clip(position / self.inv_limit, -1.0, 1.0))
+        skew_px = inv_frac * float(self.inv_skew_ticks) * self.tick
+
+        if skew_px >= 0:
+            # long: move bid down more than ask
+            bid = mid - half_spread - 2.0 * skew_px
+            ask = mid + half_spread - 1.0 * skew_px
+        else:
+            # short: move ask up more than bid
+            bid = mid - half_spread - 1.0 * skew_px
+            ask = mid + half_spread - 2.0 * skew_px
+
+        bid = round_to_tick(bid, self.tick, side="down")
+        ask = round_to_tick(ask, self.tick, side="up")
+
+        # Guard against crossing due to large skew
+        if np.isfinite(bid) and np.isfinite(ask) and bid >= ask:
+            ask = round_to_tick(bid + self.tick, self.tick, side="up")
 
         # Hard limit: disable side that increases exposure
         if position >= self.inv_limit:
