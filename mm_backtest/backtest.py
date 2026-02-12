@@ -34,16 +34,13 @@ def backtest(
     fill_full_qty_on_touch: bool = True,
     use_side_filter: bool = True,
     quote_every_n: int = 1,
-    # Dynamic spread
     min_spread_ticks: int = 1,
     max_spread_ticks: int = 20,
     vol_window: int = 50,
     vol_mult: float = 3.0,
-    # Inventory risk management (taker unwind)
-    enable_taker_unwind: bool = True,
+    enable_taker_unwind: bool = False,
     unwind_to: float = 0.0,
     taker_slip_ticks: int = 1,
-    # Anti-toxic flow (optional)
     flow_window: int = 50,
     flow_skew_ticks: float = 0.0,
 ) -> pd.DataFrame:
