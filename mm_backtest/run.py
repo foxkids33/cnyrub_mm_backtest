@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Taker unwind
     p.add_argument("--enable_taker_unwind", action="store_true", help="Enable taker unwind when inventory breaks limit.")
-    p.set_defaults(enable_taker_unwind=True)
+    p.set_defaults(enable_taker_unwind=False)
     p.add_argument("--unwind_to", type=float, default=0.0, help="Target inventory after unwind (default 0).")
     p.add_argument("--taker_slip_ticks", type=int, default=1, help="Conservative slip in ticks for taker unwind.")
 

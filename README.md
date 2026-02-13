@@ -28,7 +28,7 @@ python3 -m mm_backtest.run \
   --vol_window 50 --vol_mult 3.0 \
   --qty 300000 --inv_limit 3000000 --inv_skew_ticks 10 \
   --quote_every_n 1 \
-  --flow_window 50 --flow_skew_ticks 2.0 \
+  --flow_window 50 --flow_skew_ticks 0.0 \
   --enable_taker_unwind --unwind_to 1500000 --taker_slip_ticks 1 \
   --metric_freq 1s
 
