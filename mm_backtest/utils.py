@@ -63,11 +63,7 @@ def round_to_tick(price: float, tick: float, side: str = "nearest") -> float:
 
 
 def price_to_tick_int(price: float, tick: float, side: str = "nearest") -> int:
-    """Convert a price to an integer number of ticks.
 
-    Prefer integer ticks for comparisons (e.g., fill conditions) to avoid
-    fragile float equality.
-    """
     if not np.isfinite(price):
         return 0
     if tick <= 0:
@@ -75,7 +71,6 @@ def price_to_tick_int(price: float, tick: float, side: str = "nearest") -> int:
 
     x = price / tick
 
-    # Tiny epsilons reduce off-by-1 from binary float representation.
     eps = 1e-12
     if side == "down":
         return int(np.floor(x + eps))

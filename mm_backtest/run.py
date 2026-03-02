@@ -14,7 +14,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trades", type=str, required=True, help="Path to trades.parquet")
     p.add_argument("--out_pnl", type=str, default="pnl.csv", help="Output path for pnl csv")
 
-    # Strategy parameters
     p.add_argument("--base_spread_ticks", type=int, default=2)
     p.add_argument("--min_spread_ticks", type=int, default=1)
     p.add_argument("--max_spread_ticks", type=int, default=20)
@@ -37,7 +36,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fill_full_qty_on_touch", action="store_true", help="Fill full qty if any trade touches the quote.")
     p.set_defaults(fill_full_qty_on_touch=True)
 
-    # Taker unwind
     p.add_argument("--enable_taker_unwind", action="store_true", help="Enable taker unwind when inventory breaks limit.")
     p.set_defaults(enable_taker_unwind=False)
     p.add_argument("--unwind_to", type=float, default=0.0, help="Target inventory after unwind (default 0).")
